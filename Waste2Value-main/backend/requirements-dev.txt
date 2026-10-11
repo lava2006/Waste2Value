@@ -1,0 +1,2 @@
+-r requirements.txt
+moto[dynamodb,kms,s3,sns]>=5.0.0

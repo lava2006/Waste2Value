@@ -1,0 +1,25 @@
+# secrets / local config
+.env
+.env.*
+!.env.example
+*.pem
+.aws/
+
+# build + deploy artifacts
+build/
+.aws-sam/
+*.zip
+packaged.yaml
+cfn-outputs.json
+
+# python
+__pycache__/
+*.pyc
+.pytest_cache/
+backend/waste2value.db
+*.db
+
+# editors / os
+.vscode/
+.idea/
+.DS_Store

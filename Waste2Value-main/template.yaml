@@ -1,0 +1,576 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Waste2Value - e-waste recycling verification platform.
+  CloudFront + S3 site, API Gateway HTTP API + Lambda (FastAPI), DynamoDB registry,
+  S3 evidence storage, Amazon Textract OCR, Amazon Bedrock investigator, AWS KMS passport
+  signing, Amazon Cognito auth, Step Functions + SNS workflow, CloudWatch + Budgets.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedPattern: '[a-z][a-z0-9-]{1,10}'
+    Description: Environment name used in resource names.
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional. Receives auditor-review notifications, alarms and budget alerts. Leave empty to skip subscriptions.
+  BedrockModelId:
+    Type: String
+    Default: us.amazon.nova-lite-v1:0
+    Description: >
+      Bedrock model / inference-profile id for the AI investigator and PDF reading. Amazon Nova works on free-plan
+      accounts; Anthropic Claude needs the Anthropic use-case form (e.g. us.anthropic.claude-haiku-4-5-20251001-v1:0).
+  BedrockFoundationModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+    Description: Underlying foundation model (for IAM). Must match BedrockModelId.
+  ExtractionProvider:
+    Type: String
+    Default: rekognition
+    AllowedValues: [rekognition, textract]
+    Description: >
+      rekognition = Amazon Rekognition DetectText for images (+ Amazon Nova for PDFs); works on free-plan accounts.
+      textract = Amazon Textract (requires an account that is subscribed to Textract).
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 40
+    Description: Monthly account cost budget in USD (alerts at 50% and 80% actual, 100% forecast) when AlertEmail is set.
+  SiteOrigin:
+    Type: String
+    Default: ''
+    Description: >
+      The CloudFront site origin (https://dxxxx.cloudfront.net). Empty on the first deploy; the deploy script
+      redeploys with the value so Cognito callbacks and evidence-bucket CORS can reference it without a resource cycle.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+  HasSiteOrigin: !Not [!Equals [!Ref SiteOrigin, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 1024
+    Architectures: [x86_64]
+    Environment:
+      Variables:
+        STAGE: !Ref Stage
+        REPOSITORY: dynamodb
+        REGISTRY_TABLE: !Ref RegistryTable
+        SIGNING: kms
+        KMS_KEY_ARN: !GetAtt PassportSigningKey.Arn
+        EXTRACTION: !Ref ExtractionProvider
+        EXTRACTION_VISION_MODEL_ID: !Ref BedrockModelId
+        EVIDENCE_BUCKET: !Ref EvidenceBucket
+        AI: bedrock
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+        ALERT_TOPIC_ARN: !Ref AlertTopic
+
+Resources:
+  # ===================================================================== STORAGE
+  WebBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'w2v-web-${Stage}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+
+  WebBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub '${WebBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'w2v-evidence-${Stage}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      VersioningConfiguration: { Status: Enabled }
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST, GET, HEAD]
+            AllowedOrigins: [!If [HasSiteOrigin, !Ref SiteOrigin, 'http://localhost:3000']]
+            AllowedHeaders: ['*']
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanUp
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+
+  RegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'w2v-registry-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+        - { AttributeName: GSI1PK, AttributeType: S }
+        - { AttributeName: GSI1SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - { AttributeName: GSI1PK, KeyType: HASH }
+            - { AttributeName: GSI1SK, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+
+  # ===================================================================== CRYPTOGRAPHY
+  PassportSigningKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Asymmetric RSA_4096 key that signs Circularity Passports (RSASSA_PSS_SHA_256).
+      KeySpec: RSA_4096
+      KeyUsage: SIGN_VERIFY
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Root delegation: IAM policies on the Lambda roles grant Sign/Verify (no role ARNs here -> no cycles).
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }
+            Action: 'kms:*'
+            Resource: '*'
+
+  PassportSigningKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/w2v-passport-signer-${Stage}'
+      TargetKeyId: !Ref PassportSigningKey
+
+  # ===================================================================== AUTH (Cognito)
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'w2v-${Stage}'
+      UsernameAttributes: [email]
+      # Self sign-up (Hosted UI shows "Sign up"); the e-mail address is verified with a code before first sign-in.
+      AutoVerifiedAttributes: [email]
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: false }
+      Policies:
+        PasswordPolicy: { MinimumLength: 10, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: false }
+      AccountRecoverySetting:
+        RecoveryMechanisms: [{ Name: verified_email, Priority: 1 }]
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub 'w2v-web-${Stage}'
+      GenerateSecret: false
+      # Admin-only password flow (needs IAM credentials) used for operational smoke tests; browsers use the code flow.
+      ExplicitAuthFlows: [ALLOW_ADMIN_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !If [HasSiteOrigin, !Sub '${SiteOrigin}/auth/callback/', http://localhost:3000/auth/callback/]
+        - http://localhost:3000/auth/callback/
+      LogoutURLs:
+        - !If [HasSiteOrigin, !Sub '${SiteOrigin}/', http://localhost:3000/]
+        - http://localhost:3000/
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 12
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: hours }
+      PreventUserExistenceErrors: ENABLED
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub 'w2v-${Stage}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  # ===================================================================== COMPUTE
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: 'sts:AssumeRole' }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: Waste2ValueLeastPrivilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan, dynamodb:BatchWriteItem, dynamodb:DescribeTable]
+                Resource: [!GetAtt RegistryTable.Arn, !Sub '${RegistryTable.Arn}/index/*']
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${EvidenceBucket.Arn}/*'
+              - Effect: Allow
+                Action: [kms:Sign, kms:Verify, kms:GetPublicKey, kms:DescribeKey]
+                Resource: !GetAtt PassportSigningKey.Arn
+              - Effect: Allow
+                Action: [textract:AnalyzeDocument, rekognition:DetectText]
+                Resource: '*'
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:Converse]
+                Resource:
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/${BedrockFoundationModelId}'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/${BedrockModelId}'
+              - Effect: Allow
+                Action: [states:StartExecution]
+                Resource: !Ref VerificationStateMachine
+              - Effect: Allow
+                Action: [states:DescribeExecution]
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${VerificationStateMachine.Name}:*'
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'w2v-api-${Stage}'
+      CodeUri: build/lambda.zip
+      Handler: app.main.handler
+      Role: !GetAtt ApiFunctionRole.Arn
+      Environment:
+        Variables:
+          REQUIRE_AUTH: 'true'
+          STATE_MACHINE_ARN: !Ref VerificationStateMachine
+      Events:
+        PublicHealth:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /api/health, Method: GET, Auth: { Authorizer: NONE } }
+        PublicHealthRoot:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /health, Method: GET, Auth: { Authorizer: NONE } }
+        PublicIntegrations:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /api/integrations, Method: GET, Auth: { Authorizer: NONE } }
+        PublicVerify:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/api/verify/{id}', Method: GET, Auth: { Authorizer: NONE } }
+        PublicTamperDemo:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/api/verify/{id}/tamper-demo', Method: POST, Auth: { Authorizer: NONE } }
+        Proxy:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: '/{proxy+}', Method: ANY }
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/w2v-api-${Stage}'
+      RetentionInDays: 14
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings: { ThrottlingBurstLimit: 40, ThrottlingRateLimit: 20 }
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              audience: [!Ref UserPoolClient]
+
+  # ===================================================================== WORKFLOW (Step Functions + SNS)
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'w2v-alerts-${Stage}'
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  WorkflowFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: 'sts:AssumeRole' }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: Waste2ValueWorkflow
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query, dynamodb:Scan, dynamodb:BatchWriteItem, dynamodb:DescribeTable]
+                Resource: [!GetAtt RegistryTable.Arn, !Sub '${RegistryTable.Arn}/index/*']
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${EvidenceBucket.Arn}/*'
+              - Effect: Allow
+                Action: [kms:Sign, kms:Verify, kms:DescribeKey]
+                Resource: !GetAtt PassportSigningKey.Arn
+              - Effect: Allow
+                Action: [textract:AnalyzeDocument, rekognition:DetectText]
+                Resource: '*'
+              - Effect: Allow
+                Action: [bedrock:InvokeModel, bedrock:Converse]
+                Resource:
+                  - !Sub 'arn:aws:bedrock:*::foundation-model/${BedrockFoundationModelId}'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/${BedrockModelId}'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref AlertTopic
+
+  WorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'w2v-workflow-${Stage}'
+      CodeUri: build/lambda.zip
+      Handler: app.workflow.handler
+      Role: !GetAtt WorkflowFunctionRole.Arn
+      Timeout: 120
+
+  WorkflowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/w2v-workflow-${Stage}'
+      RetentionInDays: 14
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: states.amazonaws.com }, Action: 'sts:AssumeRole' }]
+      Policies:
+        - PolicyName: InvokeWorkflowFunction
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement: [{ Effect: Allow, Action: 'lambda:InvokeFunction', Resource: !GetAtt WorkflowFunction.Arn }]
+
+  VerificationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub 'w2v-verification-${Stage}'
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "Waste2Value verification: Textract -> deterministic rules -> sign passport or notify auditor",
+            "StartAt": "ExtractEvidence",
+            "States": {
+              "ExtractEvidence": {
+                "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {"FunctionName": "${Fn}", "Payload": {"Action": "EXTRACT_EVIDENCE", "batch_id.$": "$.batch_id"}},
+                "ResultSelector": {"extract.$": "$.Payload"}, "ResultPath": "$.extract",
+                "Retry": [{"ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2}],
+                "Next": "EvaluateRules"
+              },
+              "EvaluateRules": {
+                "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {"FunctionName": "${Fn}", "Payload": {"Action": "EVALUATE_RULES", "batch_id.$": "$.batch_id"}},
+                "ResultSelector": {"result.$": "$.Payload"}, "ResultPath": "$.eval",
+                "Retry": [{"ErrorEquals": ["Lambda.ServiceException", "Lambda.TooManyRequestsException"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2}],
+                "Next": "SupportedOrReview"
+              },
+              "SupportedOrReview": {
+                "Type": "Choice",
+                "Choices": [{"Variable": "$.eval.result.status", "StringEquals": "SUPPORTED", "Next": "IssuePassport"}],
+                "Default": "NotifyAuditor"
+              },
+              "IssuePassport": {
+                "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {"FunctionName": "${Fn}", "Payload": {"Action": "ISSUE_PASSPORT", "batch_id.$": "$.batch_id"}},
+                "ResultPath": null, "End": true
+              },
+              "NotifyAuditor": {
+                "Type": "Task", "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {"FunctionName": "${Fn}", "Payload": {"Action": "NOTIFY_AUDITOR", "batch_id.$": "$.batch_id"}},
+                "ResultPath": null, "End": true
+              }
+            }
+          }
+        - Fn: !GetAtt WorkflowFunction.Arn
+
+  # ===================================================================== DELIVERY (CloudFront)
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'w2v-web-oac-${Stage}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  RouteRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub 'w2v-route-rewrite-${Stage}'
+      AutoPublish: true
+      FunctionConfig: { Comment: Maps dynamic detail routes to the exported placeholder page, Runtime: cloudfront-js-2.0 }
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          var m = uri.match(/^\/(batches|evidence|passports|verify)\/([^\/]+)\/?$/);
+          var payload = uri.match(/^\/(batches|evidence|passports|verify)\/([^\/]+)\/index\.txt$/);
+          if (m && m[2] !== 'new' && m[2] !== '_') {
+            request.uri = '/' + m[1] + '/_/index.html';
+          } else if (payload && payload[2] !== 'new' && payload[2] !== '_') {
+            request.uri = '/' + payload[1] + '/_/index.txt';
+          } else if (uri.endsWith('/')) {
+            request.uri = uri + 'index.html';
+          } else if (uri.indexOf('.') === -1) {
+            request.uri = uri + '/index.html';
+          }
+          return request;
+        }
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Waste2Value ${Stage}'
+        PriceClass: PriceClass_100
+        HttpVersion: http2and3
+        DefaultRootObject: index.html
+        Origins:
+          - Id: web
+            DomainName: !GetAtt WebBucket.RegionalDomainName
+            S3OriginConfig: { OriginAccessIdentity: '' }
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+          - Id: api
+            DomainName: !Sub '${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+            CustomOriginConfig: { OriginProtocolPolicy: https-only, OriginSSLProtocols: [TLSv1.2] }
+        DefaultCacheBehavior:
+          TargetOriginId: web
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03   # Managed-SecurityHeadersPolicy
+          FunctionAssociations:
+            - { EventType: viewer-request, FunctionARN: !GetAtt RouteRewriteFunction.FunctionMetadata.FunctionARN }
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad   # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac   # Managed-AllViewerExceptHostHeader
+          - PathPattern: /health
+            TargetOriginId: api
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 404, ResponsePagePath: /404.html, ErrorCachingMinTTL: 10 }
+          - { ErrorCode: 404, ResponseCode: 404, ResponsePagePath: /404.html, ErrorCachingMinTTL: 10 }
+
+  # ===================================================================== OBSERVABILITY + COST GUARD
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'w2v-api-errors-${Stage}'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ApiFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  WorkflowFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'w2v-workflow-failed-${Stage}'
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{ Name: StateMachineArn, Value: !Ref VerificationStateMachine }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub 'w2v-${Stage}'
+      DashboardBody: !Sub |
+        {"widgets": [
+          {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"API Lambda: invocations and errors","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[["AWS/Lambda","Invocations","FunctionName","${ApiFunction}"],[".","Errors",".","."]]}},
+          {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"API Lambda: duration (p90 ms)","region":"${AWS::Region}","stat":"p90","period":300,"metrics":[["AWS/Lambda","Duration","FunctionName","${ApiFunction}"]]}},
+          {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"DynamoDB consumed capacity","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[["AWS/DynamoDB","ConsumedReadCapacityUnits","TableName","${RegistryTable}"],[".","ConsumedWriteCapacityUnits",".","."]]}},
+          {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Verification workflow","region":"${AWS::Region}","stat":"Sum","period":300,"metrics":[["AWS/States","ExecutionsStarted","StateMachineArn","${VerificationStateMachine}"],[".","ExecutionsSucceeded",".","."],[".","ExecutionsFailed",".","."]]}}
+        ]}
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: HasAlertEmail
+    Properties:
+      Budget:
+        BudgetName: !Sub 'w2v-${Stage}-monthly'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: { Amount: !Ref MonthlyBudgetUsd, Unit: USD }
+      NotificationsWithSubscribers:
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 50, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 80, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+        - Notification: { NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: 100, ThresholdType: PERCENTAGE }
+          Subscribers: [{ SubscriptionType: EMAIL, Address: !Ref AlertEmail }]
+
+Outputs:
+  SiteUrl:
+    Description: Live URL (CloudFront, HTTPS)
+    Value: !Sub 'https://${Distribution.DomainName}'
+  DistributionId:
+    Value: !Ref Distribution
+  WebBucketName:
+    Value: !Ref WebBucket
+  EvidenceBucketName:
+    Value: !Ref EvidenceBucket
+  RegistryTableName:
+    Value: !Ref RegistryTable
+  KmsSigningKeyArn:
+    Value: !GetAtt PassportSigningKey.Arn
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub '${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+  StateMachineArn:
+    Value: !Ref VerificationStateMachine
+  ApiFunctionName:
+    Value: !Ref ApiFunction
